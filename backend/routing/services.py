@@ -16,7 +16,7 @@ class PlanningError(ValueError):
 
 
 def _get(url, *, params=None, timeout=None):
-    timeout = timeout or float(os.environ.get('ROADCAST_PROVIDER_TIMEOUT', '12'))
+    timeout = timeout or float(os.environ.get('ROADCAST_PROVIDER_TIMEOUT', '8'))
     response = requests.get(url, params=params, headers={'User-Agent': 'RoadCast/1.0'}, timeout=timeout)
     response.raise_for_status()
     return response.json()
@@ -102,22 +102,40 @@ def weather_at(timeline, moment):
         raise PlanningError('The selected trip falls outside the available forecast window.')
     return {'windMph': values[0][index], 'rainInHr': values[1][index] / 25.4, 'snowInHr': values[2][index] / 2.54}
 
+# get the routes by analyzing longitude, loatitude and distance between origin and destination. 
+# If the distance is too long, we will try to get a detour route to ensure we have three distinct routes.
+def _detour_route(origin, destination, via_lon, via_lat):
+    data = _get(
+        f"{ROUTER}/route/v1/driving/{origin['lon']},{origin['lat']};{via_lon},{via_lat};{destination['lon']},{destination['lat']}",
+        params={'overview': 'full', 'geometries': 'geojson', 'steps': 'false'},
+    )
+    return (data.get('routes') or [None])[0]
+
 
 def ensure_three_routes(routes, origin, destination):
     output = list(routes)
     dx, dy = destination['lon'] - origin['lon'], destination['lat'] - origin['lat']
     length = sqrt(dx * dx + dy * dy) or 1
+    detours = [] # get the detour routes by calculating the mid point between origin and destination and then offsetting it in four directions to create detour points.
     for offset in (.45, -.45, .8, -.8):
-        if len(output) >= 3: break
         via_lon = (origin['lon'] + destination['lon']) / 2 + (-dy / length) * offset
         via_lat = (origin['lat'] + destination['lat']) / 2 + (dx / length) * offset
-        try:
-            data = _get(f"{ROUTER}/route/v1/driving/{origin['lon']},{origin['lat']};{via_lon},{via_lat};{destination['lon']},{destination['lat']}", params={
-                'overview': 'full', 'geometries': 'geojson', 'steps': 'false',
-            })
-        except requests.RequestException:
-            continue
-        candidate = (data.get('routes') or [None])[0]
+        detours.append((via_lon, via_lat))
+
+    # OSRM frequently supplies one alternative for long US trips. 
+    # Request our detours concurrently so an unavailable provider fails within one timeout window instead of blocking a serverless request repeatedly.
+    with ThreadPoolExecutor(max_workers=len(detours)) as executor:
+        futures = [executor.submit(_detour_route, origin, destination, *detour) for detour in detours]
+        candidates = []
+        for future in futures:
+            try:
+                candidates.append(future.result())
+            except requests.RequestException:
+                candidates.append(None)
+
+    for candidate in candidates:
+        if len(output) >= 3:
+            break
         if candidate and all(abs(route['distance'] - candidate['distance']) > route['distance'] * .01 for route in output):
             output.append(candidate)
     return output[:3]
@@ -125,7 +143,12 @@ def ensure_three_routes(routes, origin, destination):
 
 def plan_trip(origin_text, destination_text, departure_text, load_lbs, interval):
     departure = parse_time(departure_text)
-    origin, destination = geocode(origin_text), geocode(destination_text)
+    # Geocode the origin and destination concurrently to save time.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        origin_task = executor.submit(geocode, origin_text)
+        destination_task = executor.submit(geocode, destination_text)
+        origin, destination = origin_task.result(), destination_task.result()
+
     route_data = _get(f"{ROUTER}/route/v1/driving/{origin['lon']},{origin['lat']};{destination['lon']},{destination['lat']}", params={
         'alternatives': 3, 'overview': 'full', 'geometries': 'geojson', 'steps': 'false',
     })
